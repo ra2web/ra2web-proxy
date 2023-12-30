@@ -1,0 +1,30 @@
+{
+  "main_target_url": "https://game.chronodivide.com/",
+  "res_target_url": "https://res.ra2.bun.sh.cn/",
+  "main_entry_list": [
+    "www.ra2web.com",
+    "ra2web.com",
+    "game.ra2web.cn",
+    "cn.ra2web.cn"
+  ],
+  "res_entry_list": [
+    "res.ra2web.com",
+    "res.ra2web.cn",
+    "res.ra2.bun.sh.cn"
+  ],
+  "allowed_origins": [
+    "http://game.ra2web.cn",
+    "http://res.ra2web.cn",
+    "http://ra2web.com",
+    "http://www.ra2web.com",
+    "http://res.ra2web.com",
+    "https://ra2.igpt.wang",
+    "https://ra2res.igpt.wang",
+    "https://ra2web.com",
+    "https://www.ra2web.com",
+    "https://res.ra2web.com",
+    "https://cn.ra2web.cn",
+    "http://cn.ra2web.cn"
+  ],
+  "port": 80
+}

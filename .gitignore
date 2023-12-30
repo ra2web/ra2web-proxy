@@ -1,6 +1,9 @@
 # If you prefer the allow list template instead of the deny list, see community template:
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
+
+# IDE config
+.idea
+
 # Binaries for programs and plugins
 *.exe
 *.exe~
@@ -19,3 +22,8 @@
 
 # Go workspace file
 go.work
+
+# RA2WEB-PROXY Cache
+_cacheHacked
+_cacheRaw
+
