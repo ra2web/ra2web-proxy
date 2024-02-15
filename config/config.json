@@ -1,6 +1,6 @@
 {
   "main_target_url": "https://game.chronodivide.com/",
-  "res_target_url": "https://res.ra2.bun.sh.cn/",
+  "res_target_url": "https://res.wangyehongjing.com/",
   "main_entry_list": [
     "www.ra2web.com",
     "ra2web.com",
@@ -18,8 +18,6 @@
     "http://ra2web.com",
     "http://www.ra2web.com",
     "http://res.ra2web.com",
-    "https://ra2.igpt.wang",
-    "https://ra2res.igpt.wang",
     "https://ra2web.com",
     "https://www.ra2web.com",
     "https://res.ra2web.com",
