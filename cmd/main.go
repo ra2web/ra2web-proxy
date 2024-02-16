@@ -99,13 +99,19 @@ func main() {
 	http.HandleFunc("/proxy-svc/healthz", func(w http.ResponseWriter, r *http.Request) {
 		// 这里可以检查应用的健康状态
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, err := w.Write([]byte("OK"))
+		if err != nil {
+			return
+		}
 	})
 
 	http.HandleFunc("/proxy-svc/readyz", func(w http.ResponseWriter, r *http.Request) {
 		// 这里可以检查应用是否准备好接受流量
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, err := w.Write([]byte("OK"))
+		if err != nil {
+			return
+		}
 	})
 
 	http.HandleFunc("/config.ini", func(w http.ResponseWriter, r *http.Request) {
@@ -130,6 +136,54 @@ func main() {
 		w.Header().Set("Access-Control-Allow-Headers", "*")
 
 		http.ServeFile(w, r, "overwrite/config.ini")
+	})
+
+	http.HandleFunc("/breaking-news.html", func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			referer := r.Header.Get("Referer")
+			if referer != "" {
+				origin = getOriginFromReferer(referer)
+			}
+		}
+
+		w.Header().Del("X-Frame-Options")
+
+		// 跨域逻辑处理
+		w.Header().Del("Access-Control-Allow-Origin")
+		w.Header().Del("Access-Control-Allow-Methods")
+		w.Header().Del("Access-Control-Allow-Headers")
+		if allowedOrigins[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+
+		http.ServeFile(w, r, "overwrite/breaking-news.html")
+	})
+
+	http.HandleFunc("/servers.ini", func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			referer := r.Header.Get("Referer")
+			if referer != "" {
+				origin = getOriginFromReferer(referer)
+			}
+		}
+
+		w.Header().Del("X-Frame-Options")
+
+		// 跨域逻辑处理
+		w.Header().Del("Access-Control-Allow-Origin")
+		w.Header().Del("Access-Control-Allow-Methods")
+		w.Header().Del("Access-Control-Allow-Headers")
+		if allowedOrigins[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+
+		http.ServeFile(w, r, "overwrite/servers.ini")
 	})
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -177,17 +231,36 @@ func main() {
 				// 使用Brotli压缩
 				w.Header().Set("Content-Encoding", "br")
 				bw := brotli.NewWriterLevel(w, brotli.DefaultCompression)
-				defer bw.Close()
-				bw.Write(data)
+				defer func(bw *brotli.Writer) {
+					err := bw.Close()
+					if err != nil {
+						return
+					}
+				}(bw)
+				_, err := bw.Write(data)
+				if err != nil {
+					return
+				}
 			} else if strings.Contains(encodings, "gzip") {
 				// 使用gzip压缩
 				w.Header().Set("Content-Encoding", "gzip")
 				gz := gzip.NewWriter(w)
-				defer gz.Close()
-				gz.Write(data)
+				defer func(gz *gzip.Writer) {
+					err := gz.Close()
+					if err != nil {
+						return
+					}
+				}(gz)
+				_, err := gz.Write(data)
+				if err != nil {
+					return
+				}
 			} else {
 				// 未压缩
-				w.Write(data)
+				_, err := w.Write(data)
+				if err != nil {
+					return
+				}
 			}
 			return
 		}
@@ -199,55 +272,83 @@ func main() {
 			if r.URL.Path == "/" {
 				cachePath = filepath.Join(cacheDir, host, "index.html")
 			}
-			if shouldCache(response.Header.Get("Content-Type")) {
-				var reader io.Reader = response.Body
-				// 响应压缩算法
-				switch response.Header.Get("Content-Encoding") {
-				case "gzip":
-					reader, err = gzip.NewReader(response.Body)
+			// 只有2xx请求才考虑是否缓存，其他HTTP CODE不应该缓存处理
+			if response.StatusCode >= 200 && response.StatusCode < 300 {
+				// 判定是否应该缓存
+				if shouldCache(response) {
+					var reader io.Reader = response.Body
+					// 响应压缩算法
+					switch response.Header.Get("Content-Encoding") {
+					case "gzip":
+						reader, err = gzip.NewReader(response.Body)
+						if err != nil {
+							return err
+						}
+					case "deflate":
+						reader = flate.NewReader(response.Body)
+					case "br":
+						reader = brotli.NewReader(response.Body)
+					}
+
+					body, err := io.ReadAll(reader)
 					if err != nil {
 						return err
 					}
-				case "deflate":
-					reader = flate.NewReader(response.Body)
-				case "br":
-					reader = brotli.NewReader(response.Body)
+					response.Body = io.NopCloser(bytes.NewReader(body))
+					response.Header.Set("Content-Length", strconv.Itoa(len(body))) // 更新Content-Length头
+					// 更新Content-Encoding头
+					response.Header.Del("Content-Encoding")
+
+					isHostMatchMainSite := checkMainSiteHostMatch(cachePath, host)
+					if isHostMatchMainSite {
+						indexCachePath := strings.Replace(cachePath, host, "main.site", 1)
+						// 如果匹配，那么cachePath中一定有host的字符串，替换掉第一个成为main.site，就是正常
+						err = os.MkdirAll(filepath.Dir(indexCachePath), 0755)
+						if err != nil {
+							return err
+						}
+
+						err = os.WriteFile(indexCachePath, body, 0644)
+						if err != nil {
+							return err
+						}
+					} else {
+						err = os.MkdirAll(filepath.Dir(cachePath), 0755)
+						if err != nil {
+							return err
+						}
+
+						err = os.WriteFile(cachePath, body, 0644)
+						if err != nil {
+							return err
+						}
+					}
 				}
+			} else {
+				if response.StatusCode == http.StatusNotFound {
+					filePath := "views/404page.html"
 
-				body, err := io.ReadAll(reader)
-				if err != nil {
-					return err
-				}
-				response.Body = io.NopCloser(bytes.NewReader(body))
-				response.Header.Set("Content-Length", strconv.Itoa(len(body))) // 更新Content-Length头
-				// 更新Content-Encoding头
-				response.Header.Del("Content-Encoding")
-
-				isHostMatchMainSite := checkMainSiteHostMatch(cachePath, host)
-				if isHostMatchMainSite {
-					indexCachePath := strings.Replace(cachePath, host, "main.site", 1)
-					// 如果匹配，那么cachePath中一定有host的字符串，替换掉第一个成为main.site，就是正常
-					err = os.MkdirAll(filepath.Dir(indexCachePath), 0755)
+					// 读取错误页面文件
+					content, err := os.ReadFile(filePath)
 					if err != nil {
-						return err
+						log.Println(err)
+						// 返回基本404错误码
+						errorPage := []byte("Page 404")
+						response.Body = io.NopCloser(bytes.NewReader(errorPage))
+						response.Header.Set("Content-Length", strconv.Itoa(len(errorPage)))
+						response.Header.Set("Content-Type", "text/html")
 					}
 
-					err = os.WriteFile(indexCachePath, body, 0644)
-					if err != nil {
-						return err
-					}
+					response.Body = io.NopCloser(bytes.NewReader(content))
+					response.Header.Set("Content-Length", strconv.Itoa(len(content)))
+					response.Header.Set("Content-Type", "text/html")
 				} else {
-					err = os.MkdirAll(filepath.Dir(cachePath), 0755)
-					if err != nil {
-						return err
-					}
-
-					err = os.WriteFile(cachePath, body, 0644)
-					if err != nil {
-						return err
-					}
+					// 返回其他模式下的错误页面
+					errorPage := []byte("Page Status Error")
+					response.Body = io.NopCloser(bytes.NewReader(errorPage))
+					response.Header.Set("Content-Length", strconv.Itoa(len(errorPage)))
+					response.Header.Set("Content-Type", "text/html")
 				}
-
 			}
 			return nil
 		}
@@ -277,15 +378,21 @@ func main() {
 		responseRecorder.Header().Set("Access-Control-Allow-Methods", "*")
 		responseRecorder.Header().Set("Access-Control-Allow-Headers", "*")
 
-		// 将代理的响应写回到原始的响应写入器
-		for k, vv := range responseRecorder.Header() {
-			for _, v := range vv {
-				w.Header().Add(k, v)
+		// 只有2xx请求才考虑是否缓存，其他HTTP CODE不应该缓存处理
+		if responseRecorder.Code >= 200 && responseRecorder.Code < 300 {
+			// 只有正常情况，才将代理的响应写回到原始的响应写入器
+			for k, vv := range responseRecorder.Header() {
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
 			}
 		}
 
 		w.WriteHeader(responseRecorder.Code)
-		w.Write(responseRecorder.Body.Bytes())
+		_, err := w.Write(responseRecorder.Body.Bytes())
+		if err != nil {
+			return
+		}
 		/*
 		 *	可观测性支持部分
 		 */
@@ -318,11 +425,11 @@ func main() {
 }
 
 func mustParseURL(rawURL string) *url.URL {
-	url, err := url.Parse(rawURL)
+	parsedUrl, err := url.Parse(rawURL)
 	if err != nil {
 		log.Fatalf("Failed to parse URL %q: %v", rawURL, err)
 	}
-	return url
+	return parsedUrl
 }
 
 func logger(logChannel chan LogMessage) {
@@ -349,10 +456,11 @@ func fileExists(path string) bool {
 	return !os.IsNotExist(err)
 }
 
-func shouldCache(contentType string) bool {
+func shouldCache(response *http.Response) bool {
+	// 根据文件类型判定
+	contentType := response.Header.Get("Content-Type")
 	if strings.Contains(contentType, "text/html") ||
 		strings.Contains(contentType, "text/css") ||
-		strings.Contains(contentType, "text/plain") ||
 		strings.Contains(contentType, "application/javascript") ||
 		strings.Contains(contentType, "application/octet-stream") ||
 		strings.Contains(contentType, "image/png") ||
@@ -360,6 +468,16 @@ func shouldCache(contentType string) bool {
 		strings.Contains(contentType, "video/mp4") {
 		return true
 	}
+
+	// 除了对文件类型判定还对扩展名进行判定
+	reqUrl := response.Request.URL
+	path := reqUrl.Path
+	fileExt := filepath.Ext(path)
+
+	if fileExt != "" {
+		return true
+	}
+
 	return false
 }
 
@@ -408,8 +526,4 @@ func checkMainSiteHostMatch(input string, host string) bool {
 	}
 
 	return false
-}
-
-func hack() {
-
 }
