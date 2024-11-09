@@ -220,6 +220,7 @@ func main() {
 	http.HandleFunc("/res/locale/zh-CN.json", serveFileHandler("overwrite/zh-CN.json"))
 	http.HandleFunc("/res/locale/zh-TW.json", serveFileHandler("overwrite/zh-CN.json"))
 	http.HandleFunc("/robots.txt", serveFileHandler("overwrite/robots.txt"))
+	http.HandleFunc("/res/mods.ini", serveFileHandler("overwrite/mods.ini"))
 
 	http.HandleFunc("/", mainProxyHandler)
 
