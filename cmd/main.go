@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/andybalholm/brotli"
+	"golang.org/x/sync/singleflight"
 	"io"
 	"log"
 	"mime"
@@ -63,10 +64,7 @@ var (
 	targetsMap     = make(map[string]*url.URL)
 	targetsTypeMap = make(map[string]string)
 	logChannel     = make(chan LogMessage, 1000)
-)
-
-const (
-	ModifyHTMLFile HackActionType = "modifyHTMLFile"
+	singleGroup    singleflight.Group
 )
 
 // ModifyActionType 定义修改动作类型的枚举值
@@ -271,7 +269,48 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 			cachePath = filepath.Join(cacheDir, hostDir, r.URL.Path, "index.html")
 		}
 		if fileExists(cachePath) {
+			// 设置CORS头
 			serveFileWithCORS(w, r)
+
+			// 获取文件信息
+			fileInfo, err := os.Stat(cachePath)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			modTime := fileInfo.ModTime().UTC()
+			fileSize := fileInfo.Size()
+			etag := fmt.Sprintf(`"%x-%x"`, modTime.Unix(), fileSize)
+
+			// 设置Last-Modified和ETag头
+			w.Header().Set("Last-Modified", modTime.Format(http.TimeFormat))
+			w.Header().Set("ETag", etag)
+
+			// 设置或覆盖Server头
+			w.Header().Set("Server", "ra2web-proxy")
+
+			// 检查If-None-Match和If-Modified-Since头
+			ifNoneMatch := r.Header.Get("If-None-Match")
+			ifModifiedSince := r.Header.Get("If-Modified-Since")
+
+			// 比较ETag
+			if ifNoneMatch == etag {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+
+			// 比较Last-Modified
+			if ifModifiedSince != "" {
+				if t, err := time.Parse(http.TimeFormat, ifModifiedSince); err == nil {
+					// 如果文件未被修改
+					if modTime.Before(t.Add(1 * time.Second)) {
+						w.WriteHeader(http.StatusNotModified)
+						return
+					}
+				}
+			}
+
 			// 读取未压缩的缓存文件
 			data, err := os.ReadFile(cachePath)
 			if err != nil {
@@ -292,7 +331,7 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 			if strings.Contains(encodings, "br") {
 				// 使用Brotli压缩
 				w.Header().Set("Content-Encoding", "br")
-				bw := brotli.NewWriterLevel(w, brotli.DefaultCompression)
+				bw := brotli.NewWriterLevel(w, brotli.BestCompression)
 				defer func(bw *brotli.Writer) {
 					err := bw.Close()
 					if err != nil {
@@ -334,7 +373,7 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 		if isGetRequest {
 			// 如果请求的是根路径，则将缓存路径设置为index.html
 			if isHtmlRequest && r.URL.Path == "/" {
-				cachePath = filepath.Join(cacheDir, host, "index.html")
+				cachePath = filepath.Join(cacheDir, hostDir, "index.html")
 			}
 			if isHtmlRequest && filepath.Ext(r.URL.Path) == "" {
 				cachePath = filepath.Join(cacheDir, hostDir, r.URL.Path, "index.html")
@@ -371,7 +410,7 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 						}
 
 						// 修改 HTML 内容
-						//doc.Find("head").PrependHtml(`<base href="//wyhj.bun.sh.cn/" />`)
+						doc.Find("head").PrependHtml(`<base href="//wyhj.bun.sh.cn/" />`)
 						doc.Find("head title").SetText("网页红井-联机对战平台")
 						doc.Find(`meta[name="description"]`).Remove()
 
@@ -463,6 +502,9 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 删除X-Frame-Options头以允许所有站点
 	responseRecorder.Header().Del("X-Frame-Options")
+
+	// 设置或覆盖Server头
+	responseRecorder.Header().Set("Server", "ra2web-proxy")
 
 	// 统一跨域逻辑处理
 	responseRecorder.Header().Del("Access-Control-Allow-Origin")
@@ -645,55 +687,43 @@ func serveFileHandler(filePath string) http.HandlerFunc {
 		w.Header().Set("Access-Control-Allow-Methods", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "*")
 
+		// 设置或覆盖Server头
+		w.Header().Set("Server", "ra2web-proxy")
+
+		// 设置Last-Modified和ETag头
+		fileInfo, err := os.Stat(filePath)
+		if err == nil && !fileInfo.IsDir() {
+			modTime := fileInfo.ModTime().UTC()
+			fileSize := fileInfo.Size()
+			etag := fmt.Sprintf(`"%x-%x"`, modTime.Unix(), fileSize)
+
+			w.Header().Set("Last-Modified", modTime.Format(http.TimeFormat))
+			w.Header().Set("ETag", etag)
+
+			// 检查If-None-Match和If-Modified-Since头
+			ifNoneMatch := r.Header.Get("If-None-Match")
+			ifModifiedSince := r.Header.Get("If-Modified-Since")
+
+			// 比较ETag
+			if ifNoneMatch == etag {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+
+			// 比较Last-Modified
+			if ifModifiedSince != "" {
+				if t, err := time.Parse(http.TimeFormat, ifModifiedSince); err == nil {
+					// 如果文件未被修改
+					if modTime.Before(t.Add(1 * time.Second)) {
+						w.WriteHeader(http.StatusNotModified)
+						return
+					}
+				}
+			}
+		}
+
 		http.ServeFile(w, r, filePath)
 	}
-}
-
-// modifyHTML 根据修改点列表修改 HTML 内容
-func modifyHTML(data []byte, modifyPoints []ModifyPoint) ([]byte, error) {
-	// 解析 HTML 内容
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(data)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse HTML: %v", err)
-	}
-
-	for _, point := range modifyPoints {
-		selection := doc.Find(point.Selector)
-		if selection.Length() == 0 {
-			return nil, fmt.Errorf("selector not found: %s", point.Selector)
-		}
-
-		switch point.Action {
-		case Insert:
-			if point.Position == "before" {
-				selection.BeforeHtml(point.Content)
-			} else if point.Position == "after" {
-				selection.AfterHtml(point.Content)
-			} else {
-				return nil, fmt.Errorf("invalid position: %s", point.Position)
-			}
-		case Delete:
-			selection.Remove()
-		case Replace:
-			selection.ReplaceWithHtml(point.Content)
-		case ReplaceJS:
-			selection.Each(func(i int, s *goquery.Selection) {
-				if strings.Contains(s.Text(), point.OldContent) {
-					newContent := strings.Replace(s.Text(), point.OldContent, point.NewContent, -1)
-					s.SetText(newContent)
-				}
-			})
-		default:
-			return nil, fmt.Errorf("invalid action: %s", point.Action)
-		}
-	}
-
-	html, err := doc.Html()
-	if err != nil {
-		return nil, fmt.Errorf("failed to render HTML: %v", err)
-	}
-
-	return []byte(html), nil
 }
 
 func isDomainAllowedCallApi(host string, c Config) bool {
