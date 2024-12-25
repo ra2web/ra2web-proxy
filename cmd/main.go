@@ -6,9 +6,9 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
-	"github.com/andybalholm/brotli"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -18,6 +18,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/PuerkitoBio/goquery"
+	"github.com/andybalholm/brotli"
+	"golang.org/x/sync/singleflight"
 )
 
 type Config struct {
@@ -25,6 +29,7 @@ type Config struct {
 	MainEntryList  []string `json:"main_entry_list"`
 	ResTargetURL   string   `json:"res_target_url"`
 	ResEntryList   []string `json:"res_entry_list"`
+	ApiEndpoint    []string `json:"api_endpoint"`
 	AllowedOrigins []string `json:"allowed_origins"`
 	Port           int      `json:"port"`
 }
@@ -38,6 +43,12 @@ type LogEntry struct {
 	Latency    time.Duration `json:"latency"`
 }
 
+type CacheRequest struct {
+	Site      string `json:"site"`
+	CacheType string `json:"cacheType"`
+	FilePath  string `json:"filePath"`
+}
+
 type LogMessage struct {
 	ClientIP   string
 	RequestURL string
@@ -47,8 +58,50 @@ type LogMessage struct {
 	Latency    time.Duration
 }
 
+// HackActionType 定义枚举值
+type HackActionType string
+
+var (
+	targetsMap     = make(map[string]*url.URL)
+	targetsTypeMap = make(map[string]string)
+	logChannel     = make(chan LogMessage, 1000)
+	singleGroup    singleflight.Group
+)
+
+// ModifyActionType 定义修改动作类型的枚举值
+type ModifyActionType string
+
+const (
+	Insert    ModifyActionType = "insert"
+	Delete    ModifyActionType = "delete"
+	Replace   ModifyActionType = "replace"
+	ReplaceJS ModifyActionType = "replaceJS"
+)
+
+// ModifyPoint 定义修改点的数据结构
+type ModifyPoint struct {
+	Action     ModifyActionType `json:"action"`     // 操作类型: insert/delete/replace/replaceJS
+	Selector   string           `json:"selector"`   // CSS 选择器
+	Position   string           `json:"position"`   // 插入位置: before/after，仅在插入操作时使用
+	Content    string           `json:"content"`    // 要插入或替换的内容
+	OldContent string           `json:"oldContent"` // 旧的内联JS内容，仅在replaceJS操作时使用
+	NewContent string           `json:"newContent"` // 新的内联JS内容，仅在replaceJS操作时使用
+}
+
+// HackDetail 定义详细操作的数据结构
+type HackDetail struct {
+	ModifyPointsList []ModifyPoint `json:"modifyPointsList"`
+}
+
+// HackConfig 定义整体操作配置的数据结构
+type HackConfig struct {
+	HackAction HackActionType `json:"hackAction"`
+	HackSource string         `json:"hackSource"`
+	HackDetail HackDetail     `json:"hackDetail"`
+}
+
 var cacheDir = "./_cacheRaw"
-var hackCacheDir = "./_cacheHacked"
+var hackCacheDir = "./_cacheAfterHacked"
 
 var allowedOrigins = make(map[string]bool)
 
@@ -69,9 +122,6 @@ func main() {
 		log.Fatalf("unable to parse config file: %v", err)
 	}
 
-	targetsMap := make(map[string]*url.URL)
-	targetsTypeMap := make(map[string]string)
-
 	for _, origin := range config.AllowedOrigins {
 		allowedOrigins[origin] = true
 	}
@@ -90,13 +140,59 @@ func main() {
 	/*
 		初始化日志等可观测配件协程
 	*/
-	logChannel := make(chan LogMessage, 1000)
 	go logger(logChannel)
 
 	/*
 		路由注册与处理逻辑
 	*/
-	http.HandleFunc("/proxy-svc/healthz", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/proxy-svc/api/v1/refresh-cache", func(w http.ResponseWriter, r *http.Request) {
+		if !isDomainAllowedCallApi(r.Host, config) {
+			mainProxyHandler(w, r)
+			return
+		}
+
+		var req CacheRequest
+
+		// 解析请求体
+		err := json.NewDecoder(r.Body).Decode(&req)
+		if err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		// 检查站点和缓存类型是否为空
+		if req.Site == "" || req.CacheType == "" {
+			http.Error(w, "Site and CacheType could not empty.", http.StatusBadRequest)
+			return
+		}
+
+		log.Println("try to refresh cache", req.Site, req.CacheType, req.FilePath)
+
+		// 拼接路径
+		targetPath := filepath.Join(cacheDir, req.Site+".site")
+		if req.FilePath != "" {
+			targetPath = filepath.Join(targetPath, req.FilePath)
+		}
+
+		// 删除目录或文件
+		var deleteErr error
+		if req.FilePath == "" {
+			deleteErr = os.RemoveAll(targetPath)
+		} else {
+			deleteErr = os.Remove(targetPath)
+		}
+
+		// 处理删除错误
+		if deleteErr != nil {
+			http.Error(w, "Failed to delete cache: "+deleteErr.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// 返回成功响应
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	http.HandleFunc("/proxy-svc/api/healthz", func(w http.ResponseWriter, r *http.Request) {
 		// 这里可以检查应用的健康状态
 		w.WriteHeader(http.StatusOK)
 		_, err := w.Write([]byte("OK"))
@@ -105,7 +201,7 @@ func main() {
 		}
 	})
 
-	http.HandleFunc("/proxy-svc/readyz", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/proxy-svc/api/readyz", func(w http.ResponseWriter, r *http.Request) {
 		// 这里可以检查应用是否准备好接受流量
 		w.WriteHeader(http.StatusOK)
 		_, err := w.Write([]byte("OK"))
@@ -114,114 +210,120 @@ func main() {
 		}
 	})
 
-	http.HandleFunc("/config.ini", func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			referer := r.Header.Get("Referer")
-			if referer != "" {
-				origin = getOriginFromReferer(referer)
-			}
-		}
+	http.HandleFunc("/config.ini", serveFileHandler("overwrite/config.ini"))
+	http.HandleFunc("/breaking-news.html", serveFileHandler("overwrite/breaking-news.html"))
+	//servers.ini由作者保持最新
+	//http.HandleFunc("/servers.ini", serveFileHandler("overwrite/servers.ini"))
+	http.HandleFunc("/lib/local-trans.js", serveFileHandler("overwrite/local-trans.js"))
+	http.HandleFunc("/lib/nipplejs.js", serveFileHandler("overwrite/nipplejs.js"))
+	http.HandleFunc("/res/locale/zh-CN.json", serveFileHandler("overwrite/zh-CN.json"))
+	http.HandleFunc("/res/locale/zh-TW.json", serveFileHandler("overwrite/zh-CN.json"))
+	http.HandleFunc("/robots.txt", serveFileHandler("overwrite/robots.txt"))
+	http.HandleFunc("/res/mods.ini", serveFileHandler("overwrite/mods.ini"))
 
-		w.Header().Del("X-Frame-Options")
+	http.HandleFunc("/", mainProxyHandler)
 
-		// 跨域逻辑处理
-		w.Header().Del("Access-Control-Allow-Origin")
-		w.Header().Del("Access-Control-Allow-Methods")
-		w.Header().Del("Access-Control-Allow-Headers")
-		if allowedOrigins[origin] {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-		}
-		w.Header().Set("Access-Control-Allow-Methods", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "*")
+	/*
+		服务启动
+	*/
+	log.Println("Serving on :" + strconv.Itoa(config.Port))
+	err = http.ListenAndServe(":"+strconv.Itoa(config.Port), nil)
+	if err != nil {
+		log.Fatal("ListenAndServe: ", err)
+	}
+}
 
-		http.ServeFile(w, r, "overwrite/config.ini")
-	})
+func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	isGetRequest := r.Method == http.MethodGet
+	isHtmlRequest := strings.Contains(r.Header.Get("Accept"), "text/html")
+	host := strings.Split(r.Host, ":")[0] // 获取不带端口的主机名
+	currentTargetURL, ok := targetsMap[host]
+	if !ok {
+		http.Error(w, "HTTP CODE 403. Forbidden By Tencent EdgeOne……", http.StatusForbidden)
+		return
+	}
 
-	http.HandleFunc("/breaking-news.html", func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			referer := r.Header.Get("Referer")
-			if referer != "" {
-				origin = getOriginFromReferer(referer)
-			}
-		}
+	/*
+	 *	处理请求部分
+	 */
+	r.URL.Scheme = currentTargetURL.Scheme
+	r.URL.Host = currentTargetURL.Host
+	r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
+	r.Host = currentTargetURL.Host
 
-		w.Header().Del("X-Frame-Options")
+	targetURLType, ok := targetsTypeMap[host]
+	if !ok {
+		http.Error(w, "HTTP CODE 403. Can't Find URL Type. Forbidden By Tencent Edge One……", http.StatusForbidden)
+		return
+	}
+	hostDir := targetURLType + ".site"
 
-		// 跨域逻辑处理
-		w.Header().Del("Access-Control-Allow-Origin")
-		w.Header().Del("Access-Control-Allow-Methods")
-		w.Header().Del("Access-Control-Allow-Headers")
-		if allowedOrigins[origin] {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-		}
-		w.Header().Set("Access-Control-Allow-Methods", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "*")
-
-		http.ServeFile(w, r, "overwrite/breaking-news.html")
-	})
-
-	http.HandleFunc("/servers.ini", func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			referer := r.Header.Get("Referer")
-			if referer != "" {
-				origin = getOriginFromReferer(referer)
-			}
-		}
-
-		w.Header().Del("X-Frame-Options")
-
-		// 跨域逻辑处理
-		w.Header().Del("Access-Control-Allow-Origin")
-		w.Header().Del("Access-Control-Allow-Methods")
-		w.Header().Del("Access-Control-Allow-Headers")
-		if allowedOrigins[origin] {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-		}
-		w.Header().Set("Access-Control-Allow-Methods", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "*")
-
-		http.ServeFile(w, r, "overwrite/servers.ini")
-	})
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		host := strings.Split(r.Host, ":")[0] // 获取不带端口的主机名
-		currentTargetURL, ok := targetsMap[host]
-		if !ok {
-			http.Error(w, "HTTP CODE 403. Forbidden By Tencent EdgeOne……", http.StatusForbidden)
-			return
-		}
-
-		/*
-		 *	处理请求部分
-		 */
-		r.URL.Scheme = currentTargetURL.Scheme
-		r.URL.Host = currentTargetURL.Host
-		r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
-		r.Host = currentTargetURL.Host
-
-		targetURLType, ok := targetsTypeMap[host]
-		if !ok {
-			http.Error(w, "HTTP CODE 403. Can't Find URL Type. Forbidden By Tencent Edge One……", http.StatusForbidden)
-			return
-		}
-		hostDir := targetURLType + ".site"
-
-		// 代理缓存命中检查
-		cachePath := filepath.Join(cacheDir, hostDir, r.URL.Path)
-		if r.URL.Path == "/" {
+	// 代理缓存命中检查
+	cachePath := filepath.Join(cacheDir, hostDir, r.URL.Path)
+	// 只有GET请求才考虑缓存相关
+	if isGetRequest {
+		if isHtmlRequest && r.URL.Path == "/" {
 			cachePath = filepath.Join(cacheDir, hostDir, "index.html")
 		}
+		if isHtmlRequest && filepath.Ext(r.URL.Path) == "" {
+			cachePath = filepath.Join(cacheDir, hostDir, r.URL.Path, "index.html")
+		}
 		if fileExists(cachePath) {
+			// 设置CORS头
 			serveFileWithCORS(w, r)
+
+			// 获取文件信息
+			fileInfo, err := os.Stat(cachePath)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			modTime := fileInfo.ModTime().UTC()
+			fileSize := fileInfo.Size()
+			etag := fmt.Sprintf(`"%x-%x"`, modTime.Unix(), fileSize)
+
+			// 设置Last-Modified和ETag头
+			w.Header().Set("Last-Modified", modTime.Format(http.TimeFormat))
+			w.Header().Set("ETag", etag)
+
+			// 设置或覆盖Server头
+			w.Header().Set("Server", "ra2web-proxy")
+
+			// 检查If-None-Match和If-Modified-Since头
+			ifNoneMatch := r.Header.Get("If-None-Match")
+			ifModifiedSince := r.Header.Get("If-Modified-Since")
+
+			// 比较ETag
+			if ifNoneMatch == etag {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+
+			// 比较Last-Modified
+			if ifModifiedSince != "" {
+				if t, err := time.Parse(http.TimeFormat, ifModifiedSince); err == nil {
+					// 如果文件未被修改
+					if modTime.Before(t.Add(1 * time.Second)) {
+						w.WriteHeader(http.StatusNotModified)
+						return
+					}
+				}
+			}
+
 			// 读取未压缩的缓存文件
 			data, err := os.ReadFile(cachePath)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
+			}
+
+			// 根据文件的扩展名设置Content-Type
+			ext := filepath.Ext(cachePath)
+			mimeType := mime.TypeByExtension(ext)
+			if mimeType != "" {
+				w.Header().Set("Content-Type", mimeType)
 			}
 
 			// 检查客户端支持的压缩方法
@@ -230,7 +332,7 @@ func main() {
 			if strings.Contains(encodings, "br") {
 				// 使用Brotli压缩
 				w.Header().Set("Content-Encoding", "br")
-				bw := brotli.NewWriterLevel(w, brotli.DefaultCompression)
+				bw := brotli.NewWriterLevel(w, brotli.BestCompression)
 				defer func(bw *brotli.Writer) {
 					err := bw.Close()
 					if err != nil {
@@ -264,19 +366,25 @@ func main() {
 			}
 			return
 		}
+	}
 
-		// 创建反向代理
-		proxy := httputil.NewSingleHostReverseProxy(currentTargetURL)
-		proxy.ModifyResponse = func(response *http.Response) error {
+	// 创建反向代理
+	proxy := httputil.NewSingleHostReverseProxy(currentTargetURL)
+	proxy.ModifyResponse = func(response *http.Response) error {
+		if isGetRequest {
 			// 如果请求的是根路径，则将缓存路径设置为index.html
-			if r.URL.Path == "/" {
-				cachePath = filepath.Join(cacheDir, host, "index.html")
+			if isHtmlRequest && r.URL.Path == "/" {
+				cachePath = filepath.Join(cacheDir, hostDir, "index.html")
+			}
+			if isHtmlRequest && filepath.Ext(r.URL.Path) == "" {
+				cachePath = filepath.Join(cacheDir, hostDir, r.URL.Path, "index.html")
 			}
 			// 只有2xx请求才考虑是否缓存，其他HTTP CODE不应该缓存处理
 			if response.StatusCode >= 200 && response.StatusCode < 300 {
 				// 判定是否应该缓存
 				if shouldCache(response) {
 					var reader io.Reader = response.Body
+					var err error
 					// 响应压缩算法
 					switch response.Header.Get("Content-Encoding") {
 					case "gzip":
@@ -294,34 +402,25 @@ func main() {
 					if err != nil {
 						return err
 					}
+					// 这里插入内容是临时的，用于修改index.html，此时对于原始数据的解压已经完成
+					if r.URL.Path == "/" {
+						body, err = modifyIndexHTML(body)
+						if err != nil {
+							return err
+						}
+					}
+
+					if r.URL.Path == "/dist/workerHost.min.js" {
+						body = modifyWorkerHostJS(body)
+					}
+
 					response.Body = io.NopCloser(bytes.NewReader(body))
 					response.Header.Set("Content-Length", strconv.Itoa(len(body))) // 更新Content-Length头
 					// 更新Content-Encoding头
 					response.Header.Del("Content-Encoding")
 
-					isHostMatchMainSite := checkMainSiteHostMatch(cachePath, host)
-					if isHostMatchMainSite {
-						indexCachePath := strings.Replace(cachePath, host, "main.site", 1)
-						// 如果匹配，那么cachePath中一定有host的字符串，替换掉第一个成为main.site，就是正常
-						err = os.MkdirAll(filepath.Dir(indexCachePath), 0755)
-						if err != nil {
-							return err
-						}
-
-						err = os.WriteFile(indexCachePath, body, 0644)
-						if err != nil {
-							return err
-						}
-					} else {
-						err = os.MkdirAll(filepath.Dir(cachePath), 0755)
-						if err != nil {
-							return err
-						}
-
-						err = os.WriteFile(cachePath, body, 0644)
-						if err != nil {
-							return err
-						}
+					if err := writeCacheFile(cachePath, body); err != nil {
+						return err
 					}
 				}
 			} else {
@@ -350,77 +449,71 @@ func main() {
 					response.Header.Set("Content-Type", "text/html")
 				}
 			}
-			return nil
 		}
+		return nil
+	}
 
-		// 创建一个响应记录器来捕获响应状态码并根据不同的路由切换不同的代理
-		responseRecorder := httptest.NewRecorder()
-		proxy.ServeHTTP(responseRecorder, r)
+	// 创建一个响应记录器来捕获响应状态码并根据不同的路由切换不同的代理
+	responseRecorder := httptest.NewRecorder()
+	proxy.ServeHTTP(responseRecorder, r)
 
-		// 删除X-Frame-Options头以允许所有站点
-		responseRecorder.Header().Del("X-Frame-Options")
+	// 删除X-Frame-Options头以允许所有站点
+	responseRecorder.Header().Del("X-Frame-Options")
 
-		// 统一跨域逻辑处理
-		responseRecorder.Header().Del("Access-Control-Allow-Origin")
-		responseRecorder.Header().Del("Access-Control-Allow-Methods")
-		responseRecorder.Header().Del("Access-Control-Allow-Headers")
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			referer := r.Header.Get("Referer")
-			if referer != "" {
-				origin = getOriginFromReferer(referer)
+	// 设置或覆盖Server头
+	responseRecorder.Header().Set("Server", "ra2web-proxy")
+
+	// 统一跨域逻辑处理
+	responseRecorder.Header().Del("Access-Control-Allow-Origin")
+	responseRecorder.Header().Del("Access-Control-Allow-Methods")
+	responseRecorder.Header().Del("Access-Control-Allow-Headers")
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		referer := r.Header.Get("Referer")
+		if referer != "" {
+			origin = getOriginFromReferer(referer)
+		}
+	}
+
+	if allowedOrigins[origin] {
+		responseRecorder.Header().Set("Access-Control-Allow-Origin", "*")
+	}
+	responseRecorder.Header().Set("Access-Control-Allow-Methods", "*")
+	responseRecorder.Header().Set("Access-Control-Allow-Headers", "*")
+
+	// 只有2xx请求才考虑是否缓存，其他HTTP CODE不应该缓存处理
+	if responseRecorder.Code >= 200 && responseRecorder.Code < 300 {
+		// 只有正常情况，才将代理的响应写回到原始的响应写入器
+		for k, vv := range responseRecorder.Header() {
+			for _, v := range vv {
+				w.Header().Add(k, v)
 			}
 		}
+	}
 
-		if allowedOrigins[origin] {
-			responseRecorder.Header().Set("Access-Control-Allow-Origin", "*")
-		}
-		responseRecorder.Header().Set("Access-Control-Allow-Methods", "*")
-		responseRecorder.Header().Set("Access-Control-Allow-Headers", "*")
-
-		// 只有2xx请求才考虑是否缓存，其他HTTP CODE不应该缓存处理
-		if responseRecorder.Code >= 200 && responseRecorder.Code < 300 {
-			// 只有正常情况，才将代理的响应写回到原始的响应写入器
-			for k, vv := range responseRecorder.Header() {
-				for _, v := range vv {
-					w.Header().Add(k, v)
-				}
-			}
-		}
-
-		w.WriteHeader(responseRecorder.Code)
-		_, err := w.Write(responseRecorder.Body.Bytes())
-		if err != nil {
-			return
-		}
-		/*
-		 *	可观测性支持部分
-		 */
-		// 获取基本请求信息
-		clientIP := r.RemoteAddr
-		requestURL := r.URL.String()
-		method := r.Method
-		userAgent := r.UserAgent()
-		statusCode := responseRecorder.Result().StatusCode
-		latency := time.Since(start)
-		// 将日志消息发送到日志通道
-		logChannel <- LogMessage{
-			ClientIP:   clientIP,
-			RequestURL: requestURL,
-			Method:     method,
-			UserAgent:  userAgent,
-			StatusCode: statusCode,
-			Latency:    latency,
-		}
-	})
-
-	/*
-		服务启动
-	*/
-	log.Println("Serving on :" + strconv.Itoa(config.Port))
-	err = http.ListenAndServe(":"+strconv.Itoa(config.Port), nil)
+	w.WriteHeader(responseRecorder.Code)
+	_, err := w.Write(responseRecorder.Body.Bytes())
 	if err != nil {
-		log.Fatal("ListenAndServe: ", err)
+		return
+	}
+	/*
+	 *	可观测性支持部分
+	 */
+	// 获取基本请求信息
+	clientIP := r.RemoteAddr
+	requestURL := r.URL.String()
+	method := r.Method
+	userAgent := r.UserAgent()
+	statusCode := responseRecorder.Result().StatusCode
+	latency := time.Since(start)
+	// 将日志消息发送到日志通道
+	logChannel <- LogMessage{
+		ClientIP:   clientIP,
+		RequestURL: requestURL,
+		Method:     method,
+		UserAgent:  userAgent,
+		StatusCode: statusCode,
+		Latency:    latency,
 	}
 }
 
@@ -512,18 +605,115 @@ func getOriginFromReferer(referer string) string {
 	return origin
 }
 
-func checkMainSiteHostMatch(input string, host string) bool {
-	// 按照 \ 截取第二节内容
-	parts := strings.Split(input, "\\")
-	if len(parts) < 2 {
-		// 没有第二节内容，直接返回 false
-		return false
-	}
+// serveFileHandler 是一个通用的处理函数
+func serveFileHandler(filePath string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			referer := r.Header.Get("Referer")
+			if referer != "" {
+				origin = getOriginFromReferer(referer)
+			}
+		}
 
-	// 检查第二节内容是否和 host 一致
-	if parts[1] == host {
-		return true
-	}
+		w.Header().Del("X-Frame-Options")
 
+		// 跨域逻辑处理
+		w.Header().Del("Access-Control-Allow-Origin")
+		w.Header().Del("Access-Control-Allow-Methods")
+		w.Header().Del("Access-Control-Allow-Headers")
+		if allowedOrigins[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+
+		// 设置或覆盖Server头
+		w.Header().Set("Server", "ra2web-proxy")
+
+		// 设置Last-Modified和ETag头
+		fileInfo, err := os.Stat(filePath)
+		if err == nil && !fileInfo.IsDir() {
+			modTime := fileInfo.ModTime().UTC()
+			fileSize := fileInfo.Size()
+			etag := fmt.Sprintf(`"%x-%x"`, modTime.Unix(), fileSize)
+
+			w.Header().Set("Last-Modified", modTime.Format(http.TimeFormat))
+			w.Header().Set("ETag", etag)
+
+			// 检查If-None-Match和If-Modified-Since头
+			ifNoneMatch := r.Header.Get("If-None-Match")
+			ifModifiedSince := r.Header.Get("If-Modified-Since")
+
+			// 比较ETag
+			if ifNoneMatch == etag {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+
+			// 比较Last-Modified
+			if ifModifiedSince != "" {
+				if t, err := time.Parse(http.TimeFormat, ifModifiedSince); err == nil {
+					// 如果文件未被修改
+					if modTime.Before(t.Add(1 * time.Second)) {
+						w.WriteHeader(http.StatusNotModified)
+						return
+					}
+				}
+			}
+		}
+
+		http.ServeFile(w, r, filePath)
+	}
+}
+
+func isDomainAllowedCallApi(host string, c Config) bool {
+	for _, allowedHost := range c.ApiEndpoint {
+		if host == allowedHost {
+			return true
+		}
+	}
 	return false
+}
+
+// 添加一个新的函数来处理缓存写入
+func writeCacheFile(cachePath string, body []byte) error {
+	// 使用singleGroup来确保多次代理请求时，以第一个为准
+	_, err, _ := singleGroup.Do(cachePath, func() (interface{}, error) {
+		if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
+			return nil, err
+		}
+		return nil, os.WriteFile(cachePath, body, 0644)
+	})
+	return err
+}
+
+// 添加辅助函数来处理 index.html 的修改
+func modifyIndexHTML(body []byte) ([]byte, error) {
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	//doc.Find("head").PrependHtml(`<base href="//wyhj.bun.sh.cn/" />`)
+	doc.Find("head title").SetText("网页红井-联机对战平台")
+	doc.Find(`meta[name="description"]`).Remove()
+	doc.Find("head title").AfterHtml(`<script type="text/javascript" src="lib/nipplejs.js"></script><script type="text/javascript" src="lib/local-trans.js"></script>`)
+	doc.Find(`script[src="https://www.googletagmanager.com/gtag/js?id=G-NT498QGSGZ"]`).Remove()
+	doc.Find("head title").AfterHtml(`<meta name="description" content="在网页上就能玩经典的红色井界游戏，无需下载安装，随时随地在手机、电脑、平板甚至手表上畅玩。提供多种游戏模式和地图，与全球玩家实时对战。">`)
+	doc.Find("head title").AfterHtml(`<meta name="keywords" content="红色警戒下载, 如何玩红警, webra2, 苹果如何玩红警, 平板上如何玩红警, 手机上如何玩红警, win7如何玩红警, win10如何玩红警, win11如何玩红警, 红警, 红警2, 红色警戒2, 网页红警, 云红警, 在线游戏, 游戏平台，对战平台，战网, 红色警戒3, 红警3, RA2, RA2WEB">`)
+
+	html, err := doc.Html()
+	if err != nil {
+		return nil, err
+	}
+	return []byte(html), nil
+}
+
+// 添加辅助函数来处理 workerHost.min.js 的修改
+func modifyWorkerHostJS(body []byte) []byte {
+	bodyStr := string(body)
+	bodyStr = strings.Replace(bodyStr, `(null===(r=null==t?void 0:t.CORSWorkaround)||void 0===r||r)`, `true`, 1)
+	bodyStr = strings.Replace(bodyStr, `"string"==typeof e&&o(e)&&(null===(i=null==t?void 0:t.CORSWorkaround)||void 0===i||i)`, `true`, 1)
+	return []byte(bodyStr)
 }

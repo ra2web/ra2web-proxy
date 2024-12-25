@@ -1,6 +1,71 @@
 [
   {
-    "type": "html",
-    ""
+    "hackAction": "addFile",
+    "hackSource": "/lib/local-trans.js",
+    "hackDetail": {
+      "addFileSource": "/local-trans.js",
+      "overwrite": true
+    }
+  },
+  {
+    "hackAction": "addFile",
+    "hackSource": "/lib/nipplejs.js",
+    "hackDetail": {
+      "addFileSource": "/nipplejs.js",
+      "overwrite": true
+    }
+  },
+  {
+    "hackAction": "addFile",
+    "hackSource": "/breaking-news.html",
+    "hackDetail": {
+      "addFileSource": "/breaking-news.html",
+      "overwrite": true
+    }
+  },
+  {
+    "hackAction": "addFile",
+    "hackSource": "/config.ini",
+    "hackDetail": {
+      "addFileSource": "/config.ini",
+      "overwrite": true
+    }
+  },
+  {
+    "hackAction": "addFile",
+    "hackSource": "/servers.ini",
+    "hackDetail": {
+      "addFileSource": "/servers.ini",
+      "overwrite": true
+    }
+  },
+  {
+    "hackAction": "modifyHTMLFile",
+    "hackSource": "/index.html",
+    "hackDetail": {
+      "modifyPointsList": [
+        {
+          "action": "insert",
+          "selector": "head meta:first-of-type",
+          "position": "before",
+          "content": "<base href=\"https://example.com/\" />"
+        },
+        {
+          "action": "delete",
+          "selector": "head script[src='https://www.googletagmanager.com/gtag/js?id=G-NT498QGSGZ']"
+        },
+        {
+          "action": "replace",
+          "selector": "head title",
+          "content": "<title>New Title</title>"
+        },
+        {
+          "action": "replaceJS",
+          "selector": "script",
+          "oldContent": "console.log('old');",
+          "newContent": "console.log('new');"
+        }
+      ]
+    }
   }
 ]
