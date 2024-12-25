@@ -6,9 +6,6 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
-	"github.com/PuerkitoBio/goquery"
-	"github.com/andybalholm/brotli"
-	"golang.org/x/sync/singleflight"
 	"io"
 	"log"
 	"mime"
@@ -21,6 +18,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/PuerkitoBio/goquery"
+	"github.com/andybalholm/brotli"
+	"golang.org/x/sync/singleflight"
 )
 
 type Config struct {
@@ -403,37 +404,14 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 					}
 					// 这里插入内容是临时的，用于修改index.html，此时对于原始数据的解压已经完成
 					if r.URL.Path == "/" {
-						doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+						body, err = modifyIndexHTML(body)
 						if err != nil {
-							http.Error(w, "Unable to parse HTML", http.StatusInternalServerError)
 							return err
 						}
-
-						// 修改 HTML 内容
-						doc.Find("head").PrependHtml(`<base href="//wyhj.bun.sh.cn/" />`)
-						doc.Find("head title").SetText("网页红井-联机对战平台")
-						doc.Find(`meta[name="description"]`).Remove()
-
-						doc.Find("head title").AfterHtml(`<script type="text/javascript" src="lib/nipplejs.js"></script><script type="text/javascript" src="lib/local-trans.js"></script>`)
-						doc.Find(`script[src="https://www.googletagmanager.com/gtag/js?id=G-NT498QGSGZ"]`).Remove()
-						doc.Find("head title").AfterHtml(`<meta name="description" content="在网页上就能玩经典的红色井界游戏，无需下载安装，随时随地在手机、电脑、平板甚至手表上畅玩。提供多种游戏模式和地图，与全球玩家实时对战。">`)
-						doc.Find("head title").AfterHtml(`<meta name="keywords" content="红色警戒下载, 如何玩红警, webra2, 苹果如何玩红警, 平板上如何玩红警, 手机上如何玩红警, win7如何玩红警, win10如何玩红警, win11如何玩红警, 红警, 红警2, 红色警戒2, 网页红警, 云红警, 在线游戏, 游戏平台，对战平台，战网, 红色警戒3, 红警3, RA2, RA2WEB">`)
-
-						modifiedBody, err := doc.Html()
-						if err != nil {
-							http.Error(w, "Unable to render modified HTML", http.StatusInternalServerError)
-							return err
-						}
-
-						body = []byte(modifiedBody)
 					}
 
 					if r.URL.Path == "/dist/workerHost.min.js" {
-						bodyStr := string(body)
-						bodyStr = strings.Replace(bodyStr, `(null===(r=null==t?void 0:t.CORSWorkaround)||void 0===r||r)`, `true`, 1)
-						bodyStr = strings.Replace(bodyStr, `"string"==typeof e&&o(e)&&(null===(i=null==t?void 0:t.CORSWorkaround)||void 0===i||i)`, `true`, 1)
-
-						body = []byte(bodyStr)
+						body = modifyWorkerHostJS(body)
 					}
 
 					response.Body = io.NopCloser(bytes.NewReader(body))
@@ -441,29 +419,8 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 					// 更新Content-Encoding头
 					response.Header.Del("Content-Encoding")
 
-					isHostMatchMainSite := checkMainSiteHostMatch(cachePath, host)
-					if isHostMatchMainSite {
-						indexCachePath := strings.Replace(cachePath, host, "main.site", 1)
-						// 如果匹配，那么cachePath中一定有host的字符串，替换掉第一个成为main.site，就是正常
-						err = os.MkdirAll(filepath.Dir(indexCachePath), 0755)
-						if err != nil {
-							return err
-						}
-
-						err = os.WriteFile(indexCachePath, body, 0644)
-						if err != nil {
-							return err
-						}
-					} else {
-						err = os.MkdirAll(filepath.Dir(cachePath), 0755)
-						if err != nil {
-							return err
-						}
-
-						err = os.WriteFile(cachePath, body, 0644)
-						if err != nil {
-							return err
-						}
+					if err := writeCacheFile(cachePath, body); err != nil {
+						return err
 					}
 				}
 			} else {
@@ -648,22 +605,6 @@ func getOriginFromReferer(referer string) string {
 	return origin
 }
 
-func checkMainSiteHostMatch(input string, host string) bool {
-	// 按照 \ 截取第二节内容
-	parts := strings.Split(input, "\\")
-	if len(parts) < 2 {
-		// 没有第二节内容，直接返回 false
-		return false
-	}
-
-	// 检查第二节内容是否和 host 一致
-	if parts[1] == host {
-		return true
-	}
-
-	return false
-}
-
 // serveFileHandler 是一个通用的处理函数
 func serveFileHandler(filePath string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -733,4 +674,46 @@ func isDomainAllowedCallApi(host string, c Config) bool {
 		}
 	}
 	return false
+}
+
+// 添加一个新的函数来处理缓存写入
+func writeCacheFile(cachePath string, body []byte) error {
+	// 使用singleGroup来确保多次代理请求时，以第一个为准
+	_, err, _ := singleGroup.Do(cachePath, func() (interface{}, error) {
+		if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
+			return nil, err
+		}
+		return nil, os.WriteFile(cachePath, body, 0644)
+	})
+	return err
+}
+
+// 添加辅助函数来处理 index.html 的修改
+func modifyIndexHTML(body []byte) ([]byte, error) {
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	//doc.Find("head").PrependHtml(`<base href="//wyhj.bun.sh.cn/" />`)
+	doc.Find("head title").SetText("网页红井-联机对战平台")
+	doc.Find(`meta[name="description"]`).Remove()
+	doc.Find("head title").AfterHtml(`<script type="text/javascript" src="lib/nipplejs.js"></script><script type="text/javascript" src="lib/local-trans.js"></script>`)
+	doc.Find(`script[src="https://www.googletagmanager.com/gtag/js?id=G-NT498QGSGZ"]`).Remove()
+	doc.Find("head title").AfterHtml(`<meta name="description" content="在网页上就能玩经典的红色井界游戏，无需下载安装，随时随地在手机、电脑、平板甚至手表上畅玩。提供多种游戏模式和地图，与全球玩家实时对战。">`)
+	doc.Find("head title").AfterHtml(`<meta name="keywords" content="红色警戒下载, 如何玩红警, webra2, 苹果如何玩红警, 平板上如何玩红警, 手机上如何玩红警, win7如何玩红警, win10如何玩红警, win11如何玩红警, 红警, 红警2, 红色警戒2, 网页红警, 云红警, 在线游戏, 游戏平台，对战平台，战网, 红色警戒3, 红警3, RA2, RA2WEB">`)
+
+	html, err := doc.Html()
+	if err != nil {
+		return nil, err
+	}
+	return []byte(html), nil
+}
+
+// 添加辅助函数来处理 workerHost.min.js 的修改
+func modifyWorkerHostJS(body []byte) []byte {
+	bodyStr := string(body)
+	bodyStr = strings.Replace(bodyStr, `(null===(r=null==t?void 0:t.CORSWorkaround)||void 0===r||r)`, `true`, 1)
+	bodyStr = strings.Replace(bodyStr, `"string"==typeof e&&o(e)&&(null===(i=null==t?void 0:t.CORSWorkaround)||void 0===i||i)`, `true`, 1)
+	return []byte(bodyStr)
 }
