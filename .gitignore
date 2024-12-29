@@ -26,4 +26,5 @@ go.work
 # RA2WEB-PROXY Cache
 _cacheHacked
 _cacheRaw
+_cache
 

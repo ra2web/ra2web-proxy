@@ -1,18 +1,17 @@
 {
   "main_target_url": "https://game.chronodivide.com/",
   "res_target_url": "https://wyhjres.bun.sh.cn/",
+  "base_href": "",
   "main_entry_list": [
     "www.ra2web.com",
     "ra2web.com",
     "game.ra2web.cn",
-    "cn.ra2web.cn",
-    "127.0.0.1"
+    "cn.ra2web.cn"
   ],
   "res_entry_list": [
     "res.ra2web.com",
     "res.ra2web.cn",
-    "res.ra2.bun.sh.cn",
-    "127.0.0.1"
+    "res.ra2.bun.sh.cn"
   ],
   "api_endpoint": [
     "api.game.ra2web.cn"
@@ -28,8 +27,7 @@
     "https://www.ra2web.com",
     "https://res.ra2web.com",
     "https://cn.ra2web.cn",
-    "http://cn.ra2web.cn",
-    "http://127.0.0.1"
+    "http://cn.ra2web.cn"
   ],
   "port": 80
 }
