@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"mime"
 	"net/http"
 	"net/http/httptest"
@@ -15,12 +14,16 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"ra2web-proxy/pkg/utils"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/andybalholm/brotli"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -31,6 +34,7 @@ type Config struct {
 	ResEntryList   []string `json:"res_entry_list"`
 	ApiEndpoint    []string `json:"api_endpoint"`
 	AllowedOrigins []string `json:"allowed_origins"`
+	BaseHref       string   `json:"base_href"`
 	Port           int      `json:"port"`
 }
 
@@ -50,22 +54,28 @@ type CacheRequest struct {
 }
 
 type LogMessage struct {
-	ClientIP   string
-	RequestURL string
-	Method     string
-	UserAgent  string
-	StatusCode int
-	Latency    time.Duration
+	ClientIP    string
+	RequestURL  string
+	Method      string
+	UserAgent   string
+	StatusCode  int
+	Latency     time.Duration
+	CacheHit    bool   // 是否命中缓存
+	CachePath   string // 缓存路径
+	UpstreamURL string // 上游URL
+	Error       error  // 错误信息
 }
 
 // HackActionType 定义枚举值
 type HackActionType string
 
 var (
-	targetsMap     = make(map[string]*url.URL)
-	targetsTypeMap = make(map[string]string)
-	logChannel     = make(chan LogMessage, 1000)
+	targetsMap     sync.Map
+	targetsTypeMap sync.Map
+	logChannel     = make(chan LogMessage, 10000)
 	singleGroup    singleflight.Group
+	config         Config
+	allowedOrigins sync.Map
 )
 
 // ModifyActionType 定义修改动作类型的枚举值
@@ -101,40 +111,43 @@ type HackConfig struct {
 }
 
 var cacheDir = "./_cacheRaw"
-var hackCacheDir = "./_cacheAfterHacked"
-
-var allowedOrigins = make(map[string]bool)
 
 func main() {
+	// 配置 zerolog
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	log.Logger = log.Output(zerolog.ConsoleWriter{
+		Out:        os.Stdout,
+		TimeFormat: time.RFC3339,
+	})
+
 	/*
 		处理配置文件
 	*/
 	// 读取配置文件
 	configFile, err := os.ReadFile("config/config.json")
 	if err != nil {
-		log.Fatalf("unable to read config file: %v", err)
+		log.Fatal().Msgf("unable to read config file: %v", err)
 	}
 
-	// 解析JSON配置文件
-	var config Config
+	// 解析JSON配置文件，配置送入全局
 	err = json.Unmarshal(configFile, &config)
 	if err != nil {
-		log.Fatalf("unable to parse config file: %v", err)
+		log.Fatal().Msgf("unable to parse config file: %v", err)
 	}
 
 	for _, origin := range config.AllowedOrigins {
-		allowedOrigins[origin] = true
+		allowedOrigins.Store(origin, true)
 	}
 	// 添加 main_entry_list 中的项到 targetsMap
 	for _, entry := range config.MainEntryList {
-		targetsMap[entry] = mustParseURL(config.MainTargetURL)
-		targetsTypeMap[entry] = "main"
+		targetsMap.Store(entry, mustParseURL(config.MainTargetURL))
+		targetsTypeMap.Store(entry, "main")
 	}
 
 	// 添加 res_entry_list 中的项到 targetsMap
 	for _, entry := range config.ResEntryList {
-		targetsMap[entry] = mustParseURL(config.ResTargetURL)
-		targetsTypeMap[entry] = "res"
+		targetsMap.Store(entry, mustParseURL(config.ResTargetURL))
+		targetsTypeMap.Store(entry, "res")
 	}
 
 	/*
@@ -166,7 +179,11 @@ func main() {
 			return
 		}
 
-		log.Println("try to refresh cache", req.Site, req.CacheType, req.FilePath)
+		log.Info().
+			Str("site", req.Site).
+			Str("cacheType", req.CacheType).
+			Str("filePath", req.FilePath).
+			Msg("try to refresh cache")
 
 		// 拼接路径
 		targetPath := filepath.Join(cacheDir, req.Site+".site")
@@ -226,10 +243,10 @@ func main() {
 	/*
 		服务启动
 	*/
-	log.Println("Serving on :" + strconv.Itoa(config.Port))
+	log.Info().Msgf("Serving on :%d", config.Port)
 	err = http.ListenAndServe(":"+strconv.Itoa(config.Port), nil)
 	if err != nil {
-		log.Fatal("ListenAndServe: ", err)
+		log.Fatal().Msg("ListenAndServe: " + err.Error())
 	}
 }
 
@@ -237,27 +254,25 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	isGetRequest := r.Method == http.MethodGet
 	isHtmlRequest := strings.Contains(r.Header.Get("Accept"), "text/html")
-	host := strings.Split(r.Host, ":")[0] // 获取不带端口的主机名
-	currentTargetURL, ok := targetsMap[host]
+	host := strings.Split(r.Host, ":")[0]
+	currentTargetURLValue, ok := targetsMap.Load(host)
 	if !ok {
 		http.Error(w, "HTTP CODE 403. Forbidden By Tencent EdgeOne……", http.StatusForbidden)
 		return
 	}
+	currentTargetURL := currentTargetURLValue.(*url.URL)
 
-	/*
-	 *	处理请求部分
-	 */
 	r.URL.Scheme = currentTargetURL.Scheme
 	r.URL.Host = currentTargetURL.Host
 	r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
 	r.Host = currentTargetURL.Host
 
-	targetURLType, ok := targetsTypeMap[host]
+	targetURLType, ok := targetsTypeMap.Load(host)
 	if !ok {
 		http.Error(w, "HTTP CODE 403. Can't Find URL Type. Forbidden By Tencent Edge One……", http.StatusForbidden)
 		return
 	}
-	hostDir := targetURLType + ".site"
+	hostDir := targetURLType.(string) + ".site"
 
 	// 代理缓存命中检查
 	cachePath := filepath.Join(cacheDir, hostDir, r.URL.Path)
@@ -364,6 +379,17 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+
+			sendLog(LogMessage{
+				ClientIP:   r.RemoteAddr,
+				RequestURL: r.URL.String(),
+				Method:     r.Method,
+				UserAgent:  r.UserAgent(),
+				StatusCode: http.StatusOK,
+				Latency:    time.Since(start),
+				CacheHit:   true,
+				CachePath:  cachePath,
+			})
 			return
 		}
 	}
@@ -383,19 +409,24 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 			if response.StatusCode >= 200 && response.StatusCode < 300 {
 				// 判定是否应该缓存
 				if shouldCache(response) {
-					var reader io.Reader = response.Body
-					var err error
+					var reader io.ReadCloser = response.Body
+					defer response.Body.Close()
+
 					// 响应压缩算法
 					switch response.Header.Get("Content-Encoding") {
 					case "gzip":
-						reader, err = gzip.NewReader(response.Body)
+						gzReader, err := gzip.NewReader(response.Body)
 						if err != nil {
 							return err
 						}
+						defer gzReader.Close()
+						reader = gzReader
 					case "deflate":
 						reader = flate.NewReader(response.Body)
+						defer reader.Close()
 					case "br":
-						reader = brotli.NewReader(response.Body)
+						reader = io.NopCloser(brotli.NewReader(response.Body))
+						// brotli.Reader 不需要关闭
 					}
 
 					body, err := io.ReadAll(reader)
@@ -430,7 +461,7 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 					// 读取错误页面文件
 					content, err := os.ReadFile(filePath)
 					if err != nil {
-						log.Println(err)
+						log.Error().Err(err).Msg("Error reading 404 page")
 						// 返回基本404错误码
 						errorPage := []byte("Page 404")
 						response.Body = io.NopCloser(bytes.NewReader(errorPage))
@@ -457,7 +488,7 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 	responseRecorder := httptest.NewRecorder()
 	proxy.ServeHTTP(responseRecorder, r)
 
-	// 删除X-Frame-Options头以允许所有站点
+	// 删除X-Frame-Options头以允许有站点
 	responseRecorder.Header().Del("X-Frame-Options")
 
 	// 设置或覆盖Server头
@@ -475,7 +506,7 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if allowedOrigins[origin] {
+	if _, ok := allowedOrigins.Load(origin); ok {
 		responseRecorder.Header().Set("Access-Control-Allow-Origin", "*")
 	}
 	responseRecorder.Header().Set("Access-Control-Allow-Methods", "*")
@@ -496,50 +527,53 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	/*
-	 *	可观测性支持部分
-	 */
-	// 获取基本请求信息
-	clientIP := r.RemoteAddr
-	requestURL := r.URL.String()
-	method := r.Method
-	userAgent := r.UserAgent()
-	statusCode := responseRecorder.Result().StatusCode
-	latency := time.Since(start)
-	// 将日志消息发送到日志通道
-	logChannel <- LogMessage{
-		ClientIP:   clientIP,
-		RequestURL: requestURL,
-		Method:     method,
-		UserAgent:  userAgent,
-		StatusCode: statusCode,
-		Latency:    latency,
-	}
+
+	sendLog(LogMessage{
+		ClientIP:    r.RemoteAddr,
+		RequestURL:  r.URL.String(),
+		Method:      r.Method,
+		UserAgent:   r.UserAgent(),
+		StatusCode:  responseRecorder.Result().StatusCode,
+		Latency:     time.Since(start),
+		CacheHit:    false,
+		UpstreamURL: currentTargetURL.String(),
+		Error:       nil, // 如果有错误，设置相应的错误信息
+	})
 }
 
 func mustParseURL(rawURL string) *url.URL {
 	parsedUrl, err := url.Parse(rawURL)
 	if err != nil {
-		log.Fatalf("Failed to parse URL %q: %v", rawURL, err)
+		log.Fatal().Msgf("Failed to parse URL %q: %v", rawURL, err)
 	}
 	return parsedUrl
 }
 
 func logger(logChannel chan LogMessage) {
 	for msg := range logChannel {
-		logEntry := LogEntry{
-			ClientIP:   msg.ClientIP,
-			RequestURL: msg.RequestURL,
-			Method:     msg.Method,
-			UserAgent:  msg.UserAgent,
-			StatusCode: msg.StatusCode,
-			Latency:    msg.Latency,
+		event := log.Info()
+		if msg.Error != nil {
+			event = log.Error().Err(msg.Error)
 		}
-		logEntryJSON, err := json.Marshal(logEntry)
-		if err != nil {
-			log.Printf("Failed to marshal log entry: %v", err)
+
+		// 构建基础日志字段
+		event.Str("client_ip", msg.ClientIP).
+			Str("method", msg.Method).
+			Str("url", msg.RequestURL).
+			Int("status", msg.StatusCode).
+			Dur("latency", msg.Latency).
+			Str("user_agent", msg.UserAgent)
+
+		if msg.CacheHit {
+			// 缓存命中的日志
+			event.Bool("cache_hit", true).
+				Str("cache_path", msg.CachePath).
+				Msg("Cache Hit")
 		} else {
-			log.Println(string(logEntryJSON))
+			// 代理请求的日志
+			event.Bool("cache_hit", false).
+				Str("upstream_url", msg.UpstreamURL).
+				Msg("Proxy Request")
 		}
 	}
 }
@@ -565,13 +599,7 @@ func shouldCache(response *http.Response) bool {
 	// 除了对文件类型判定还对扩展名进行判定
 	reqUrl := response.Request.URL
 	path := reqUrl.Path
-	fileExt := filepath.Ext(path)
-
-	if fileExt != "" {
-		return true
-	}
-
-	return false
+	return filepath.Ext(path) != ""
 }
 
 func serveFileWithCORS(w http.ResponseWriter, r *http.Request) {
@@ -582,12 +610,11 @@ func serveFileWithCORS(w http.ResponseWriter, r *http.Request) {
 			origin = getOriginFromReferer(referer)
 		}
 	}
-	if allowedOrigins[origin] {
+	if _, ok := allowedOrigins.Load(origin); ok {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "*")
-	return
 }
 
 func getOriginFromReferer(referer string) string {
@@ -622,7 +649,7 @@ func serveFileHandler(filePath string) http.HandlerFunc {
 		w.Header().Del("Access-Control-Allow-Origin")
 		w.Header().Del("Access-Control-Allow-Methods")
 		w.Header().Del("Access-Control-Allow-Headers")
-		if allowedOrigins[origin] {
+		if _, ok := allowedOrigins.Load(origin); ok {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "*")
@@ -678,13 +705,63 @@ func isDomainAllowedCallApi(host string, c Config) bool {
 
 // 添加一个新的函数来处理缓存写入
 func writeCacheFile(cachePath string, body []byte) error {
-	// 使用singleGroup来确保多次代理请求时，以第一个为准
 	_, err, _ := singleGroup.Do(cachePath, func() (interface{}, error) {
+		// 确保目录存在
 		if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to create directory: %w", err)
 		}
-		return nil, os.WriteFile(cachePath, body, 0644)
+
+		// 创建临时文件
+		tmpFile, err := os.CreateTemp(filepath.Dir(cachePath), "tmp-*")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temp file: %w", err)
+		}
+		tmpPath := tmpFile.Name()
+
+		// 获取文件锁
+		if err := utils.LockFile(tmpFile); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+			return nil, fmt.Errorf("failed to lock file: %w", err)
+		}
+
+		// 确保函数返回前解锁和清理
+		defer func() {
+			utils.UnlockFile(tmpFile)
+			tmpFile.Close()
+			os.Remove(tmpPath)
+		}()
+
+		// 写入数据
+		if _, err := tmpFile.Write(body); err != nil {
+			return nil, fmt.Errorf("failed to write to temp file: %w", err)
+		}
+
+		// 强制同步到磁盘
+		if err := tmpFile.Sync(); err != nil {
+			return nil, fmt.Errorf("failed to sync temp file: %w", err)
+		}
+
+		// 关闭文件（保持锁定）
+		if err := tmpFile.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close temp file: %w", err)
+		}
+
+		// 原子性地重命名文件
+		if err := os.Rename(tmpPath, cachePath); err != nil {
+			return nil, fmt.Errorf("failed to rename temp file: %w", err)
+		}
+
+		// 打开新文件并同步目录
+		dir, err := os.Open(filepath.Dir(cachePath))
+		if err == nil {
+			dir.Sync() // 同步目录确保重命名操作持久化
+			dir.Close()
+		}
+
+		return nil, nil
 	})
+
 	return err
 }
 
@@ -695,7 +772,11 @@ func modifyIndexHTML(body []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	//doc.Find("head").PrependHtml(`<base href="//wyhj.bun.sh.cn/" />`)
+	// 从配置中读取 base_href
+	if config.BaseHref != "" {
+		doc.Find("head").PrependHtml(fmt.Sprintf(`<base href="%s" />`, config.BaseHref))
+	}
+
 	doc.Find("head title").SetText("网页红井-联机对战平台")
 	doc.Find(`meta[name="description"]`).Remove()
 	doc.Find("head title").AfterHtml(`<script type="text/javascript" src="lib/nipplejs.js"></script><script type="text/javascript" src="lib/local-trans.js"></script>`)
@@ -716,4 +797,18 @@ func modifyWorkerHostJS(body []byte) []byte {
 	bodyStr = strings.Replace(bodyStr, `(null===(r=null==t?void 0:t.CORSWorkaround)||void 0===r||r)`, `true`, 1)
 	bodyStr = strings.Replace(bodyStr, `"string"==typeof e&&o(e)&&(null===(i=null==t?void 0:t.CORSWorkaround)||void 0===i||i)`, `true`, 1)
 	return []byte(bodyStr)
+}
+
+// 添加辅助函数来发送日志
+func sendLog(msg LogMessage) {
+	select {
+	case logChannel <- msg:
+		// 成功发送
+	default:
+		// 通道已满，直接打印日志避免阻塞
+		log.Warn().
+			Str("client_ip", msg.ClientIP).
+			Str("url", msg.RequestURL).
+			Msg("Log channel full, message dropped")
+	}
 }
