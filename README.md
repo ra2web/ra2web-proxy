@@ -10,8 +10,9 @@
 
 要开始使用，请按照以下步骤进行操作：
 
-1. 使用 `go build` 命令构建项目。
-2. 在您的机器上运行 `ra2web-proxy` 可执行文件。
+1.使用 `go build` 命令构建项目。  
+2.在您的机器上运行 `ra2web-proxy` 可执行文件。  
+3.如果想要以 https 方式访问，参考 HTTPS 配置的部分。  
 
 ## 开发
 
@@ -23,9 +24,40 @@
 ```
 127.0.0.1 game.ra2web.cn
 127.0.0.1 res.ra2web.cn
+127.0.0.1 cn.ra2web.cn
 ```
 
-接下来以 /cmd/main.go 为入口启动工程，访问 http://game.ra2web.cn 即可
+3.以 /cmd/main.go 为入口启动工程，访问 http://game.ra2web.cn 即可。  
+4.如果想要以 https 方式访问，参考 HTTPS 配置的部分。  
+
+
+## HTTPS 配置
+
+如果想要以 https 方式访问，需要先生成 SSL 证书:
+
+```bash 
+openssl genrsa -out cert.key 2048
+openssl req -new -key cert.key -out cert.csr -subj "/CN=*.ra2web.cn"
+openssl x509 -req -days 365 -in cert.csr -signkey cert.key -out cert.crt
+```
+
+然后修改 config/config.json，增加 https 配置：
+
+```json
+{
+  "https": {
+    "port": 443,
+    "cert": "cert.crt",
+    "key": "cert.key"
+  }
+}
+```
+
+> 注意：首次访问页面会报错，是因为自签证书导致域名 `cn.ra2web.cn` 和 `res.ra2web.cn` 不被浏览器信任，有两种解决方案：
+> * 使用正式的证书。
+> * 手动在浏览器访问这两个地址，让浏览器信任即可，只需要操作一次。  
+>    * https://cn.ra2web.cn
+>    * https://res.ra2web.cn
 
 ## 下一步计划
 

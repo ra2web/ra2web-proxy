@@ -22,20 +22,32 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/singleflight"
 )
 
 type Config struct {
-	MainTargetURL  string   `json:"main_target_url"`
-	MainEntryList  []string `json:"main_entry_list"`
-	ResTargetURL   string   `json:"res_target_url"`
-	ResEntryList   []string `json:"res_entry_list"`
-	ApiEndpoint    []string `json:"api_endpoint"`
-	AllowedOrigins []string `json:"allowed_origins"`
-	BaseHref       string   `json:"base_href"`
-	Port           int      `json:"port"`
+	MainTargetURL  string       `json:"main_target_url"`
+	MainEntryList  []string     `json:"main_entry_list"`
+	ResTargetURL   string       `json:"res_target_url"`
+	ResEntryList   []string     `json:"res_entry_list"`
+	ApiEndpoint    []string     `json:"api_endpoint"`
+	AllowedOrigins []string     `json:"allowed_origins"`
+	BaseHref       string       `json:"base_href"`
+	HTTP           ConfigHTTP   `json:"http"`
+	HTTPS          *ConfigHTTPS `json:"https"`
+}
+
+type ConfigHTTP struct {
+	Port int `json:"port"`
+}
+
+type ConfigHTTPS struct {
+	Port int    `json:"port"`
+	Cert string `json:"cert"`
+	Key  string `json:"key"`
 }
 
 type LogEntry struct {
@@ -240,14 +252,36 @@ func main() {
 
 	http.HandleFunc("/", mainProxyHandler)
 
-	/*
-		服务启动
-	*/
-	log.Info().Msgf("Serving on :%d", config.Port)
-	err = http.ListenAndServe(":"+strconv.Itoa(config.Port), nil)
-	if err != nil {
-		log.Fatal().Msg("ListenAndServe: " + err.Error())
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		/*
+			服务启动
+		*/
+		log.Info().Msgf("Serving http on :%d", config.HTTP.Port)
+		err = http.ListenAndServe(":"+strconv.Itoa(config.HTTP.Port), nil)
+		if err != nil {
+			log.Fatal().Msgf("ListenAndServe: %s", err.Error())
+		}
+	}()
+
+	if config.HTTPS != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			/*
+				服务启动
+			*/
+			log.Info().Msgf("Serving https on :%d", config.HTTPS.Port)
+			err = http.ListenAndServeTLS(":"+strconv.Itoa(config.HTTPS.Port), config.HTTPS.Cert, config.HTTPS.Key, nil)
+			if err != nil {
+				log.Fatal().Msgf("ListenAndServe: %s", err.Error())
+			}
+		}()
 	}
+
+	wg.Wait()
 }
 
 func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
@@ -260,12 +294,8 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "HTTP CODE 403. Forbidden By Tencent EdgeOne……", http.StatusForbidden)
 		return
 	}
-	currentTargetURL := currentTargetURLValue.(*url.URL)
-
-	r.URL.Scheme = currentTargetURL.Scheme
-	r.URL.Host = currentTargetURL.Host
-	r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
-	r.Host = currentTargetURL.Host
+	// 设置CORS头
+	serveFileWithCORS(w, r)
 
 	targetURLType, ok := targetsTypeMap.Load(host)
 	if !ok {
@@ -285,8 +315,6 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 			cachePath = filepath.Join(cacheDir, hostDir, r.URL.Path, "index.html")
 		}
 		if fileExists(cachePath) {
-			// 设置CORS头
-			serveFileWithCORS(w, r)
 
 			// 获取文件信息
 			fileInfo, err := os.Stat(cachePath)
@@ -394,6 +422,13 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	currentTargetURL := currentTargetURLValue.(*url.URL)
+
+	r.URL.Scheme = currentTargetURL.Scheme
+	r.URL.Host = currentTargetURL.Host
+	r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
+	r.Host = currentTargetURL.Host
+
 	// 创建反向代理
 	proxy := httputil.NewSingleHostReverseProxy(currentTargetURL)
 	proxy.ModifyResponse = func(response *http.Response) error {
@@ -427,6 +462,12 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 					case "br":
 						reader = io.NopCloser(brotli.NewReader(response.Body))
 						// brotli.Reader 不需要关闭
+					case "zstd":
+						decoder, err := zstd.NewReader(response.Body)
+						if err != nil {
+							return err
+						}
+						reader = io.NopCloser(decoder)
 					}
 
 					body, err := io.ReadAll(reader)
@@ -494,10 +535,6 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 	// 设置或覆盖Server头
 	responseRecorder.Header().Set("Server", "ra2web-proxy")
 
-	// 统一跨域逻辑处理
-	responseRecorder.Header().Del("Access-Control-Allow-Origin")
-	responseRecorder.Header().Del("Access-Control-Allow-Methods")
-	responseRecorder.Header().Del("Access-Control-Allow-Headers")
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		referer := r.Header.Get("Referer")
@@ -506,18 +543,12 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if _, ok := allowedOrigins.Load(origin); ok {
-		responseRecorder.Header().Set("Access-Control-Allow-Origin", "*")
-	}
-	responseRecorder.Header().Set("Access-Control-Allow-Methods", "*")
-	responseRecorder.Header().Set("Access-Control-Allow-Headers", "*")
-
 	// 只有2xx请求才考虑是否缓存，其他HTTP CODE不应该缓存处理
 	if responseRecorder.Code >= 200 && responseRecorder.Code < 300 {
 		// 只有正常情况，才将代理的响应写回到原始的响应写入器
 		for k, vv := range responseRecorder.Header() {
 			for _, v := range vv {
-				w.Header().Add(k, v)
+				w.Header().Set(k, v)
 			}
 		}
 	}
