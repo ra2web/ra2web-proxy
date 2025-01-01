@@ -18,7 +18,7 @@
   ],
   "allowed_origins": [
     "http://game.ra2web.cn",
-    "https://game.ra2web.cn/",
+    "https://game.ra2web.cn",
     "http://res.ra2web.cn",
     "http://ra2web.com",
     "http://www.ra2web.com",
@@ -29,5 +29,7 @@
     "https://cn.ra2web.cn",
     "http://cn.ra2web.cn"
   ],
-  "port": 80
+  "http": {
+    "port": 80
+  }
 }
